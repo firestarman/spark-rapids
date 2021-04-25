@@ -359,6 +359,68 @@ private[python] object BatchGroupedIterator extends Arm {
     new ColumnarBatch(outputColumns.toArray, batch.numRows())
   }
 
+  /**
+   * Extracts one key row for each group in the input batch, and returns the extracted rows as
+   * a new batch.
+   *
+   * It supposes the rows in the input batch are presorted in the order of
+   * `Ascending & NullsFirst`.
+   *
+   * @param batch the input batch
+   * @param groupingRefs the bound references for grouping columns
+   * @return a batch consisting of one the key row for each group. Users need to close it when
+   *         no longer need it.
+   */
+  def extractKeyRowForGroups(
+      batch: ColumnarBatch,
+      groupingRefs: Seq[GpuExpression]): ColumnarBatch = {
+    if (groupingRefs.isEmpty) {
+      // No grouping columns, then the whole batch is a group. Returns the dedicated batch
+      // as the group key.
+      // This batch means there is only one empty row, just like the 'new UnsafeRow()'
+      // used in Spark. The row number setting to 1 is because Python returns only one row
+      // as the aggregate result for the whole batch, and 'CombiningIterator' requires the
+      // the same row number for both the key batch and the result batch to be combined.
+      new ColumnarBatch(Array(), 1)
+    } else {
+      // Extracts the first row in each group as the key row, by running a 'groupBy' with
+      // 'nth' aggregation.
+
+      // The rows are already sorted by grouping keys in the order of `Ascending & NullsFirst`
+      // for Pandas UDF plans in Spark. So tells this to cudf for a better performance
+      // on `groupBy` operation.
+      val builder = cudf.GroupByOptions.builder()
+                        .withIgnoreNullKeys(false)
+                        .withKeysSorted(true)
+                        .withKeysDescending(groupingRefs.map(_ => false): _*)
+                        .withKeysNullSmallest(groupingRefs.map(_ => true): _*)
+      // The cudf aggregation used to perform the `groupby`. Its output is excluded from
+      // the returned batch since we only need the key columns for each group.
+      val cudfStubAgg = cudf.Aggregation.count(cudf.Aggregation.NullPolicy.INCLUDE)
+
+      // Projects to the grouping columns first to reduce the data size for `groupBy` op.
+      val keyTable = withResource(GpuProjectExec.project(batch, groupingRefs)) { keyBatch =>
+        val groupingIndices = groupingRefs.indices
+        withResource(GpuColumnVector.from(keyBatch)) { table =>
+          table.groupBy(builder.build(), groupingIndices: _*)
+               .aggregate(cudfStubAgg.onColumn(0))
+        }
+      }
+      // (No need to restore the order of the rows after `groupBy` because cudf
+      //  will keep it unchanged when being told keys are already sorted.)
+
+      // Drops the duplicated result column for the aggregate 'nth'.
+      // And converts to a batch.
+      withResource(keyTable) { table =>
+        // No 'safeMap' because 'cudf.Table.getColumn' does not increase the ref count.
+        val keyColumns = groupingRefs.indices.map(table.getColumn(_))
+        withResource(new cudf.Table(keyColumns: _*)) { keyTable =>
+          GpuColumnVector.from(keyTable, groupingRefs.map(_.dataType).toArray)
+        }
+      }
+    }
+  }
+
 }
 
 /**
@@ -378,11 +440,11 @@ private[python] object BatchGroupedIterator extends Arm {
  * @param numOutputBatches a metric for output batches
  */
 private[python] class CombiningIterator(
-    inputBatchQueue: BatchQueue,
-    pythonOutputIter: Iterator[ColumnarBatch],
-    pythonArrowReader: GpuPythonArrowOutput,
-    numOutputRows: GpuMetric,
-    numOutputBatches: GpuMetric) extends Iterator[ColumnarBatch] with Arm {
+    val inputBatchQueue: BatchQueue,
+    val pythonOutputIter: Iterator[ColumnarBatch],
+    val pythonArrowReader: GpuPythonArrowOutput,
+    val numOutputRows: GpuMetric,
+    val numOutputBatches: GpuMetric) extends Iterator[ColumnarBatch] with Arm {
 
   // For `hasNext` we are waiting on the queue to have something inserted into it
   // instead of waiting for a result to be ready from python. The reason for this
@@ -417,7 +479,7 @@ private[python] class CombiningIterator(
     }
   }
 
-  private def combine(lBatch: ColumnarBatch, rBatch: ColumnarBatch): ColumnarBatch = {
+  protected def combine(lBatch: ColumnarBatch, rBatch: ColumnarBatch): ColumnarBatch = {
     val lColumns = GpuColumnVector.extractColumns(lBatch).map(_.incRefCount())
     val rColumns = GpuColumnVector.extractColumns(rBatch).map(_.incRefCount())
     new ColumnarBatch(lColumns ++ rColumns, lBatch.numRows())
