@@ -231,7 +231,7 @@ def test_group_agg(enable_cudf_udf):
     def _sum_cpu_func(v: pd.Series) -> int:
         return v.sum()
 
-    @pandas_udf("integer")
+    @pandas_udf("int")
     def _sum_gpu_func(v: pd.Series) -> int:
         import cudf
         gpu_series = cudf.Series(v)
@@ -254,7 +254,7 @@ def test_sql_group(enable_cudf_udf):
     def _sum_cpu_func(v: pd.Series) -> int:
         return v.sum()
 
-    @pandas_udf("integer")
+    @pandas_udf("int")
     def _sum_gpu_func(v: pd.Series) -> int:
         import cudf
         gpu_series = cudf.Series(v)
@@ -275,14 +275,12 @@ def test_sql_group(enable_cudf_udf):
 
 # ======= Test Window In Pandas =======
 @cudf_udf
-@pytest.mark.xfail(condition=is_databricks_runtime(),
-    reason='https://github.com/NVIDIA/spark-rapids/issues/2372')
 def test_window(enable_cudf_udf):
     @pandas_udf("int")
     def _sum_cpu_func(v: pd.Series) -> int:
         return v.sum()
 
-    @pandas_udf("integer")
+    @pandas_udf("int")
     def _sum_gpu_func(v: pd.Series) -> int:
         import cudf
         gpu_series = cudf.Series(v)
